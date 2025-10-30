@@ -4,7 +4,7 @@
 # Version: 2.0
 # 特性：移除跟踪、支持自定义密码、配置备份
 # =====================================================
-
+ 
 set -euo pipefail
 
 VERSION='Sing-box Installer v2.0'
