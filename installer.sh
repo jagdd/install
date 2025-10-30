@@ -753,7 +753,7 @@ show_menu_hint() {
 # ---------- 快捷命令 ----------
 install_shortcut() {
   local cmd_path="/usr/local/bin/menu"
-  local script_url="https://raw.githubusercontent.com/你的用户名/你的仓库/main/installer.sh"
+  local script_url="https://raw.githubusercontent.com/jagdd/install/refs/heads/main/installer.sh"
   
   # 创建快捷命令
   cat > "$cmd_path" <<EOF
