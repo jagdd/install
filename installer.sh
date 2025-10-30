@@ -685,7 +685,7 @@ show_service_status() {
   else
     rc-service sing-box status || true
   fi
-  
+    
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo -e "${YELLOW}最近日志：${RESET}"
