@@ -14,7 +14,7 @@ WORK_DIR='/etc/sing-box'
 LOG_DIR="${WORK_DIR}/logs"
 CONF_DIR="${WORK_DIR}/conf"
 BACKUP_DIR="${WORK_DIR}/backup"
-DEFAULT_PORT_REALITY=443
+DEFAULT_PORT_REALITY=$((RANDOM % 25536 + 40000))
 DEFAULT_PORT_WS=8080
 DEFAULT_PORT_SS=8388
 TLS_SERVER_DEFAULT='www.cloudflare.com'
@@ -226,10 +226,16 @@ read_uuid() {
     UUID=$(cat /proc/sys/kernel/random/uuid)
     ok "已自动生成 UUID: ${UUID}"
   else
-    if [[ ! "$UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-      warn "UUID 格式不正确，自动生成新的..."
-      UUID=$(cat /proc/sys/kernel/random/uuid)
-      ok "已自动生成 UUID: ${UUID}"
+    # 简化UUID验证，支持更多格式
+    if [ ${#UUID} -lt 32 ]; then
+      warn "UUID 格式可能不正确，建议使用标准UUID格式"
+      read -rp "是否使用此UUID？(y/N): " confirm
+      if [[ "${confirm,,}" != "y" ]]; then
+        UUID=$(cat /proc/sys/kernel/random/uuid)
+        ok "已自动生成 UUID: ${UUID}"
+      else
+        ok "使用自定义 UUID: ${UUID}"
+      fi
     else
       ok "使用自定义 UUID: ${UUID}"
     fi
@@ -471,45 +477,145 @@ change_port() {
 change_user_cred() {
   echo ""
   echo "选择要修改凭据的协议："
-  echo "1) VLESS（Reality + WS 会同时修改 UUID）"
-  echo "2) Shadowsocks 密码"
-  read -rp "输入 1/2: " which
+  echo "1) VLESS UUID（Reality + WS 会同时修改）"
+  echo "2) VLESS Reality 密钥对（重新生成 Private/Public Key）"
+  echo "3) Shadowsocks 密码"
+  read -rp "输入 1/2/3: " which
   
   case "$which" in
     1)
       local f1="${CONF_DIR}/10_vless_tcp_reality.json"
       local f2="${CONF_DIR}/11_vless_ws.json"
+      
+      # 显示当前UUID
       if [ -f "$f1" ]; then
         local old_uuid
         old_uuid=$(jq -r '..|objects|select(has("users"))|.users[]?.uuid' "$f1" | head -n1)
         ok "当前 UUID: ${old_uuid}"
+      elif [ -f "$f2" ]; then
+        local old_uuid
+        old_uuid=$(jq -r '..|objects|select(has("users"))|.users[]?.uuid' "$f2" | head -n1)
+        ok "当前 UUID: ${old_uuid}"
       fi
-      read_uuid
+      
+      echo ""
+      echo "请输入新的 UUID（直接回车将自动生成）:"
+      read -rp "> " new_uuid
+      
+      if [ -z "$new_uuid" ]; then
+        new_uuid=$(cat /proc/sys/kernel/random/uuid)
+        ok "✅ 已自动生成 UUID: ${new_uuid}"
+      else
+        # 简单验证长度
+        if [ ${#new_uuid} -lt 32 ]; then
+          warn "UUID 长度不足，自动生成新的..."
+          new_uuid=$(cat /proc/sys/kernel/random/uuid)
+          ok "✅ 已自动生成 UUID: ${new_uuid}"
+        else
+          ok "✅ 使用自定义 UUID: ${new_uuid}"
+        fi
+      fi
+      
+      UUID="$new_uuid"
+      
       for f in "$f1" "$f2"; do
         [ -f "$f" ] || continue
         jq --arg u "$UUID" '(.. | objects | select(has("users")) | .users[]? | select(has("uuid"))).uuid = $u' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
       done
+      
       merge_config
       svc_restart
       ok "✅ VLESS UUID 已修改为: ${UUID}"
-      log_action "VLESS UUID 已修改"
+      log_action "VLESS UUID 已修改为: ${UUID}"
       show_menu_hint
       ;;
+      
     2)
+      local f="${CONF_DIR}/10_vless_tcp_reality.json"
+      [ -f "$f" ] || die "未检测到 VLESS Reality 配置"
+      
+      # 显示当前密钥
+      if [ -f "${CONF_DIR}/reality_public.key" ]; then
+        local old_pub
+        old_pub=$(cat "${CONF_DIR}/reality_public.key")
+        ok "当前 PublicKey: ${old_pub}"
+      fi
+      
+      echo ""
+      warn "⚠️  将重新生成 Reality 密钥对（PrivateKey + PublicKey）"
+      read -rp "确认重新生成？(y/N): " confirm
+      
+      if [[ "${confirm,,}" != "y" ]]; then
+        warn "已取消操作"
+        return
+      fi
+      
+      # 生成新的密钥对
+      local kp priv pub
+      kp="$("${WORK_DIR}/sing-box" generate reality-keypair)"
+      priv="$(awk '/PrivateKey/{print $NF}' <<<"$kp")"
+      pub="$(awk '/PublicKey/{print $NF}' <<<"$kp")"
+      
+      # 保存密钥
+      echo "$priv" > "${CONF_DIR}/reality_private.key"
+      echo "$pub" > "${CONF_DIR}/reality_public.key"
+      
+      # 更新配置文件中的私钥
+      jq --arg priv "$priv" '
+        (.. | objects | select(has("reality")) | .reality.private_key) = $priv
+      ' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+      
+      merge_config
+      svc_restart
+      
+      ok "✅ Reality 密钥对已重新生成"
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo -e "${GREEN}新的 PublicKey（客户端使用）：${RESET}"
+      echo -e "${YELLOW}${pub}${RESET}"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+      warn "⚠️  请更新客户端配置中的 PublicKey！"
+      
+      log_action "Reality 密钥对已重新生成"
+      show_menu_hint
+      ;;
+      
+    3)
       local f="${CONF_DIR}/12_ss.json"
       [ -f "$f" ] || die "未检测到 Shadowsocks 配置"
+      
+      # 显示当前密码
       local old_pass
       old_pass=$(jq -r '..|objects|select(has("password"))|.password' "$f" | head -n1)
       ok "当前密码: ${old_pass}"
-      local newpass
-      newpass=$(read_password "请输入新的 SS 密码")
-      jq --arg p "$newpass" '(.. | objects | select(has("password"))).password = $p' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+      
+      echo ""
+      echo "请输入新的密码（直接回车将自动生成）:"
+      read -rp "> " new_pass
+      
+      if [ -z "$new_pass" ]; then
+        new_pass=$(cat /proc/sys/kernel/random/uuid)
+        ok "✅ 已自动生成密码: ${new_pass}"
+      else
+        if [ ${#new_pass} -lt 8 ]; then
+          warn "密码长度不足8位，自动生成安全密码..."
+          new_pass=$(cat /proc/sys/kernel/random/uuid)
+          ok "✅ 已自动生成密码: ${new_pass}"
+        else
+          ok "✅ 使用自定义密码: ${new_pass}"
+        fi
+      fi
+      
+      jq --arg p "$new_pass" '(.. | objects | select(has("password"))).password = $p' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+      
       merge_config
       svc_restart
-      ok "✅ Shadowsocks 密码已修改为: ${newpass}"
-      log_action "Shadowsocks 密码已修改"
+      ok "✅ Shadowsocks 密码已修改为: ${new_pass}"
+      log_action "Shadowsocks 密码已修改为: ${new_pass}"
       show_menu_hint
       ;;
+      
     *) err "无效选择" ;;
   esac
 }
@@ -675,6 +781,298 @@ show_menu_hint() {
   echo -e "${GREEN}如需重新打开菜单，请输入：${RESET}${YELLOW}menu${RESET}"
   echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   echo ""
+}
+
+export_config() {
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo -e " ${BLUE}导出配置参数${RESET}"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  
+  local export_file="/root/singbox-export.txt"
+  
+  # 清空或创建文件
+  > "$export_file"
+  
+  echo "# Sing-box 配置参数导出" >> "$export_file"
+  echo "# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')" >> "$export_file"
+  echo "" >> "$export_file"
+  
+  local found=false
+  
+  # 导出 VLESS Reality 配置
+  if [ -f "${CONF_DIR}/10_vless_tcp_reality.json" ]; then
+    found=true
+    echo "[VLESS Reality]" >> "$export_file"
+    
+    local uuid port sni priv pub
+    uuid=$(jq -r '..|objects|select(has("users"))|.users[]?.uuid' "${CONF_DIR}/10_vless_tcp_reality.json" | head -n1)
+    port=$(jq -r '..|objects|select(has("listen_port"))|.listen_port' "${CONF_DIR}/10_vless_tcp_reality.json" | head -n1)
+    sni=$(jq -r '..|objects|select(has("server_name"))|.server_name' "${CONF_DIR}/10_vless_tcp_reality.json" | head -n1)
+    priv=$(cat "${CONF_DIR}/reality_private.key" 2>/dev/null || echo "")
+    pub=$(cat "${CONF_DIR}/reality_public.key" 2>/dev/null || echo "")
+    
+    echo "UUID=$uuid" >> "$export_file"
+    echo "PORT=$port" >> "$export_file"
+    echo "SNI=$sni" >> "$export_file"
+    echo "PRIVATE_KEY=$priv" >> "$export_file"
+    echo "PUBLIC_KEY=$pub" >> "$export_file"
+    echo "" >> "$export_file"
+  fi
+  
+  # 导出 VLESS WS 配置
+  if [ -f "${CONF_DIR}/11_vless_ws.json" ]; then
+    found=true
+    echo "[VLESS WS]" >> "$export_file"
+    
+    local uuid port path
+    uuid=$(jq -r '..|objects|select(has("users"))|.users[]?.uuid' "${CONF_DIR}/11_vless_ws.json" | head -n1)
+    port=$(jq -r '..|objects|select(has("listen_port"))|.listen_port' "${CONF_DIR}/11_vless_ws.json" | head -n1)
+    path=$(jq -r '..|objects|select(has("transport"))|.transport.path' "${CONF_DIR}/11_vless_ws.json" | head -n1)
+    
+    echo "UUID=$uuid" >> "$export_file"
+    echo "PORT=$port" >> "$export_file"
+    echo "PATH=$path" >> "$export_file"
+    echo "" >> "$export_file"
+  fi
+  
+  # 导出 Shadowsocks 配置
+  if [ -f "${CONF_DIR}/12_ss.json" ]; then
+    found=true
+    echo "[Shadowsocks]" >> "$export_file"
+    
+    local port pass method
+    port=$(jq -r '..|objects|select(has("listen_port"))|.listen_port' "${CONF_DIR}/12_ss.json" | head -n1)
+    pass=$(jq -r '..|objects|select(has("password"))|.password' "${CONF_DIR}/12_ss.json" | head -n1)
+    method=$(jq -r '..|objects|select(has("method"))|.method' "${CONF_DIR}/12_ss.json" | head -n1)
+    
+    echo "PORT=$port" >> "$export_file"
+    echo "PASSWORD=$pass" >> "$export_file"
+    echo "METHOD=$method" >> "$export_file"
+    echo "" >> "$export_file"
+  fi
+  
+  if [ "$found" = false ]; then
+    warn "未检测到任何配置"
+    rm -f "$export_file"
+    return
+  fi
+  
+  ok "✅ 配置已导出到: ${export_file}"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  cat "$export_file"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  ok "💡 使用方法："
+  echo "1. 复制以上内容保存到本地"
+  echo "2. 在新服务器上选择菜单中的'导入配置'"
+  echo "3. 粘贴配置内容即可自动部署"
+  echo ""
+  log_action "配置已导出"
+  show_menu_hint
+}
+
+import_config() {
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo -e " ${BLUE}导入配置参数${RESET}"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  
+  echo "请选择导入方式："
+  echo "1) 从文件导入 (/root/singbox-export.txt)"
+  echo "2) 手动输入配置内容"
+  read -rp "选择 1/2: " import_method
+  
+  local config_file=""
+  
+  case "$import_method" in
+    1)
+      config_file="/root/singbox-export.txt"
+      if [ ! -f "$config_file" ]; then
+        err "未找到配置文件: $config_file"
+        echo "请先将配置文件上传到该位置"
+        return
+      fi
+      ;;
+    2)
+      config_file="/tmp/singbox-import-$.txt"
+      echo ""
+      echo "请粘贴配置内容（粘贴完成后按 Ctrl+D）："
+      cat > "$config_file"
+      ;;
+    *)
+      err "无效选择"
+      return
+      ;;
+  esac
+  
+  # 解析配置
+  local protocol=""
+  while IFS= read -r line; do
+    # 跳过注释和空行
+    [[ "$line" =~ ^#.*$ ]] && continue
+    [[ -z "$line" ]] && continue
+    
+    # 检测协议类型
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      protocol="${BASH_REMATCH[1]}"
+      continue
+    fi
+    
+    # 解析参数
+    if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
+      local key="${BASH_REMATCH[1]}"
+      local value="${BASH_REMATCH[2]}"
+      
+      case "$protocol" in
+        "VLESS Reality")
+          case "$key" in
+            UUID) IMPORT_REALITY_UUID="$value" ;;
+            PORT) IMPORT_REALITY_PORT="$value" ;;
+            SNI) IMPORT_REALITY_SNI="$value" ;;
+            PRIVATE_KEY) IMPORT_REALITY_PRIV="$value" ;;
+            PUBLIC_KEY) IMPORT_REALITY_PUB="$value" ;;
+          esac
+          ;;
+        "VLESS WS")
+          case "$key" in
+            UUID) IMPORT_WS_UUID="$value" ;;
+            PORT) IMPORT_WS_PORT="$value" ;;
+            PATH) IMPORT_WS_PATH="$value" ;;
+          esac
+          ;;
+        "Shadowsocks")
+          case "$key" in
+            PORT) IMPORT_SS_PORT="$value" ;;
+            PASSWORD) IMPORT_SS_PASS="$value" ;;
+            METHOD) IMPORT_SS_METHOD="$value" ;;
+          esac
+          ;;
+      esac
+    fi
+  done < "$config_file"
+  
+  # 清理临时文件
+  [ "$import_method" = "2" ] && rm -f "$config_file"
+  
+  echo ""
+  echo "检测到以下配置："
+  echo ""
+  
+  # 显示检测到的配置
+  if [ -n "$IMPORT_REALITY_UUID" ]; then
+    echo -e "${GREEN}✓ VLESS Reality${RESET}"
+    echo "  UUID: $IMPORT_REALITY_UUID"
+    echo "  端口: $IMPORT_REALITY_PORT"
+    echo "  SNI: $IMPORT_REALITY_SNI"
+    echo ""
+  fi
+  
+  if [ -n "$IMPORT_WS_UUID" ]; then
+    echo -e "${GREEN}✓ VLESS WS${RESET}"
+    echo "  UUID: $IMPORT_WS_UUID"
+    echo "  端口: $IMPORT_WS_PORT"
+    echo ""
+  fi
+  
+  if [ -n "$IMPORT_SS_PORT" ]; then
+    echo -e "${GREEN}✓ Shadowsocks${RESET}"
+    echo "  端口: $IMPORT_SS_PORT"
+    echo "  密码: $IMPORT_SS_PASS"
+    echo ""
+  fi
+  
+  read -rp "确认导入？(y/N): " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    warn "已取消导入"
+    return
+  fi
+  
+  # 执行导入
+  ensure_singbox
+  ensure_systemd_service
+  
+  # 导入 VLESS Reality
+  if [ -n "$IMPORT_REALITY_UUID" ]; then
+    ok "正在导入 VLESS Reality..."
+    
+    echo "$IMPORT_REALITY_PRIV" > "${CONF_DIR}/reality_private.key"
+    echo "$IMPORT_REALITY_PUB" > "${CONF_DIR}/reality_public.key"
+    
+    cat > "${CONF_DIR}/10_vless_tcp_reality.json" <<EOF
+{
+  "inbounds": [{
+    "type": "vless",
+    "tag": "vless-reality",
+    "listen": "::",
+    "listen_port": ${IMPORT_REALITY_PORT},
+    "users": [{ "uuid": "${IMPORT_REALITY_UUID}" }],
+    "tls": {
+      "enabled": true,
+      "server_name": "${IMPORT_REALITY_SNI}",
+      "reality": {
+        "enabled": true,
+        "handshake": { "server": "${IMPORT_REALITY_SNI}", "server_port": 443 },
+        "private_key": "${IMPORT_REALITY_PRIV}",
+        "short_id": [""]
+      }
+    }
+  }]
+}
+EOF
+    ok "✅ VLESS Reality 导入完成"
+  fi
+  
+  # 导入 VLESS WS
+  if [ -n "$IMPORT_WS_UUID" ]; then
+    ok "正在导入 VLESS WS..."
+    
+    cat > "${CONF_DIR}/11_vless_ws.json" <<EOF
+{
+  "inbounds": [{
+    "type": "vless",
+    "tag": "vless-ws",
+    "listen": "::",
+    "listen_port": ${IMPORT_WS_PORT},
+    "users": [{ "uuid": "${IMPORT_WS_UUID}" }],
+    "transport": {
+      "type": "ws",
+      "path": "${IMPORT_WS_PATH}"
+    }
+  }]
+}
+EOF
+    ok "✅ VLESS WS 导入完成"
+  fi
+  
+  # 导入 Shadowsocks
+  if [ -n "$IMPORT_SS_PORT" ]; then
+    ok "正在导入 Shadowsocks..."
+    
+    cat > "${CONF_DIR}/12_ss.json" <<EOF
+{
+  "inbounds": [{
+    "type": "shadowsocks",
+    "tag": "shadowsocks",
+    "listen": "::",
+    "listen_port": ${IMPORT_SS_PORT},
+    "method": "${IMPORT_SS_METHOD}",
+    "password": "${IMPORT_SS_PASS}"
+  }]
+}
+EOF
+    ok "✅ Shadowsocks 导入完成"
+  fi
+  
+  merge_config
+  svc_restart
+  
+  ok "✅ 所有配置导入完成！"
+  log_action "配置已导入"
+  show_menu_hint
 }
 
 install_shortcut() {
